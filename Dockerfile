@@ -1,8 +1,13 @@
 FROM python:3.11-slim
 
-# Prevent Python from buffering stdout/stderr
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
+# Make Python friendlier in containers
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# Install tzdata (for ZoneInfo timezones) and libgfortran5 (for swisseph)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends tzdata libgfortran5 && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
