@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORROS_Middleware as CORSMiddleware  # type: ignore
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Literal, Tuple, Dict
 from datetime import datetime, timedelta, date
@@ -10,16 +10,14 @@ import math
 import swisseph as swe  # Swiss Ephemeris
 
 app = FastAPI(title="Jyotisa Compute API", version="2.0.0")
-
 # --- CORS (allow GPT Actions) ---
 app.add_middleware(
-    CORSMiddleware,  # type: ignore
+    CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 # -----------------------------
 # Swiss Ephemeris configuration
 # -----------------------------
