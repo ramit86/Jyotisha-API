@@ -1,3 +1,5 @@
+# main.py — Jyotisa Compute API (v2.2.0)
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -7,9 +9,10 @@ from zoneinfo import ZoneInfo
 from astral import LocationInfo
 from astral.sun import sun
 import math
+import re
 import swisseph as swe  # Swiss Ephemeris
 
-app = FastAPI(title="Jyotisa Compute API", version="2.1.0")
+app = FastAPI(title="Jyotisa Compute API", version="2.2.0")
 
 # --- CORS (allow GPT Actions) ---
 app.add_middleware(
@@ -23,9 +26,10 @@ app.add_middleware(
 # -----------------------------
 # Swiss Ephemeris configuration
 # -----------------------------
-# NOTE: set_ephe_path requires str (not bytes). Empty string = packaged/default path.
-swe.set_ephe_path("")            # ✅ string, not bytes
-swe.set_sid_mode(swe.SIDM_LAHIRI, 0, 0)  # default Lahiri
+# NOTE: set_ephe_path expects str (not bytes). Empty string => default packaged path.
+swe.set_ephe_path("")
+# Default ayanamsha (can be changed per-request)
+swe.set_sid_mode(swe.SIDM_LAHIRI, 0, 0)
 
 # -----------------------------
 # Constants & lookups
@@ -38,6 +42,10 @@ SEG_27 = 360.0 / 27.0
 TITHI_DEG = 12.0
 KARANA_DEG = 6.0
 
+SIGN_NAMES = [
+    "Aries","Taurus","Gemini","Cancer","Leo","Virgo",
+    "Libra","Scorpio","Sagittarius","Capricorn","Aquarius","Pisces"
+]
 TITHI_NAMES = [
     "Shukla Pratipada","Shukla Dwitiya","Shukla Tritiya","Shukla Chaturthi","Shukla Panchami",
     "Shukla Shashti","Shukla Saptami","Shukla Ashtami","Shukla Navami","Shukla Dashami",
@@ -74,19 +82,19 @@ DAYS_PER_YEAR = 365.2425
 # Models
 # -----------------------------
 class BirthChartIn(BaseModel):
-    dob_iso: str
-    tob_iso: str
+    dob_iso: str                     # "YYYY-MM-DD"
+    tob_iso: str                     # accepts "HH:MM", "HH:MM:SS", or "h:MM AM/PM"
     lat: float
-    lon: float
-    tz: str = IST
+    lon: float                       # East = positive, West = negative
+    tz: str = IST                    # e.g., "Asia/Kolkata"
     ayanamsha: Literal["Lahiri","Raman","Krishnamurti"] = "Lahiri"
     vargas: List[str] = Field(default_factory=lambda: ["D1","D9","D10"])
 
 class DashaIn(BaseModel):
-    start_iso: str  # Birth datetime (tz-aware preferred, e.g. "1986-02-07T04:20:00+05:30")
+    start_iso: str                   # Birth datetime; tz-aware preferred
     method: Literal["Vimshottari","Yogini","CharA"] = "Vimshottari"
-    levels: int = 3  # 1=Mahadasha, 2=+Antar, 3=+Pratyantar
-    tz: str = IST    # Output timezone for dates (default Asia/Kolkata)
+    levels: int = 3                  # 1=Mahadasha, 2=+Antar, 3=+Pratyantar
+    tz: str = IST                    # Output timezone for dates
 
 class TransitsIn(BaseModel):
     from_iso: str
@@ -104,6 +112,14 @@ class PanchangaIn(BaseModel):
     date_iso: str
     lat: float = HRISHIKESH_LAT
     lon: float = HRISHIKESH_LON
+    tz: str = IST
+    ayanamsha: Literal["Lahiri","Raman","Krishnamurti"] = "Lahiri"
+
+class DebugBirthIn(BaseModel):
+    dob_iso: str
+    tob_iso: str
+    lat: float
+    lon: float
     tz: str = IST
     ayanamsha: Literal["Lahiri","Raman","Krishnamurti"] = "Lahiri"
 
@@ -152,6 +168,84 @@ def find_event_end_time(start_utc: datetime, predicate_crosses, max_hours=48, co
             lo = mid
     return hi
 
+# --- Robust birth time parsing (24h or AM/PM) ---
+_AMPM_RE = re.compile(r"^\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*([AaPp][Mm])\s*$")
+
+def parse_time_24_or_ampm(tob_str: str) -> Tuple[int,int,int]:
+    """
+    Accepts '04:20', '04:20:00', '4:20 AM', '4:20 pm', '04:20:00 AM'
+    Returns (hour24, minute, second).
+    """
+    s = tob_str.strip()
+    m = _AMPM_RE.match(s)
+    if m:
+        hh, mm, ss, ampm = m.groups()
+        hh = int(hh); mm = int(mm); ss = int(ss) if ss else 0
+        ampm = ampm.upper()
+        if hh == 12:
+            hh = 0
+        if ampm == "PM":
+            hh += 12
+        return (hh, mm, ss)
+    # 24h formats
+    parts = s.split(":")
+    if len(parts) not in (2,3):
+        raise ValueError("Time must be HH:MM or HH:MM:SS or include AM/PM")
+    hh = int(parts[0]); mm = int(parts[1]); ss = int(parts[2]) if len(parts)==3 else 0
+    if not (0 <= hh < 24 and 0 <= mm < 60 and 0 <= ss < 60):
+        raise ValueError("Invalid time fields")
+    return (hh, mm, ss)
+
+def local_to_utc(dob_iso: str, tob_str: str, tz: str) -> datetime:
+    """
+    Combine local date + time and convert to UTC using ZoneInfo(tz).
+    """
+    y, m, d = map(int, dob_iso.split("-"))
+    hh, mm, ss = parse_time_24_or_ampm(tob_str)
+    local_dt = datetime(y, m, d, hh, mm, ss, tzinfo=ZoneInfo(tz))
+    return local_dt.astimezone(ZoneInfo("UTC"))
+
+def jdut_from_local(dob_iso: str, tob_str: str, tz: str) -> float:
+    return to_jd_ut(local_to_utc(dob_iso, tob_str, tz))
+
+# --- Ascendant helpers (two independent methods for cross-check) ---
+def ascendant_tropical_deg(jd_ut: float, lat: float, lon: float) -> float:
+    cusps, ascmc = swe.houses_ex(jd_ut, lat, lon, b'W', 0)  # tropical
+    return norm360(ascmc[0])
+
+def current_ayanamsa_deg(jd_ut: float) -> float:
+    return norm360(swe.get_ayanamsa_ut(jd_ut))
+
+def ascendant_sidereal_deg_by_subtract(jd_ut: float, lat: float, lon: float) -> float:
+    asc_trop = ascendant_tropical_deg(jd_ut, lat, lon)
+    ayan = current_ayanamsa_deg(jd_ut)
+    return norm360(asc_trop - ayan)
+
+def ascendant_sidereal_deg(jd_ut: float, lat: float, lon: float) -> float:
+    cusps, ascmc = swe.houses_ex(jd_ut, lat, lon, b'W', swe.FLG_SIDEREAL)
+    return norm360(ascmc[0])
+
+def planet_sidereal(jd_ut: float, p_id: int) -> Tuple[float, float]:
+    flags = swe.FLG_SWIEPH | swe.FLG_SIDEREAL | swe.FLG_SPEED
+    lon, lat, dist, lspd, _, _ = swe.calc_ut(jd_ut, p_id, flags)
+    return norm360(lon), lspd
+
+def sign_index(lon_deg: float) -> int:
+    return int(lon_deg // 30) + 1  # 1..12
+
+def degree_in_sign(lon_deg: float) -> float:
+    return lon_deg % 30.0
+
+def whole_sign_house(planet_sign_idx: int, asc_sign_idx: int) -> int:
+    return ((planet_sign_idx - asc_sign_idx) % 12) + 1
+
+def moon_nakshatra_name_pada(moon_lon_sid: float) -> Tuple[str, int]:
+    idx = int(moon_lon_sid // SEG_27) + 1
+    name = NAK_NAMES[idx - 1]
+    arc_in_nak = (moon_lon_sid % SEG_27) * 60.0  # arcminutes
+    pada = int(arc_in_nak // 200) + 1
+    return name, pada
+
 # -----------------------------
 # Panchanga core
 # -----------------------------
@@ -181,320 +275,4 @@ def yoga_index_and_end(sunrise_utc: datetime, ayanamsha: str) -> Tuple[int, date
     s, m = sun_moon_sidereal_longitudes(sunrise_utc, ayanamsha)
     y = norm360(s + m)
     idx = int(y // SEG_27) + 1
-    target = ((math.floor(y / SEG_27) + 1) * SEG_27) % 360.0
-    def crosses(t: datetime) -> bool:
-        s2, m2 = sun_moon_sidereal_longitudes(t, ayanamsha)
-        y2 = norm360(s2 + m2)
-        return y2 < SEG_27 if target == 0 else y2 >= target
-    end_time = find_event_end_time(sunrise_utc, crosses)
-    return idx, end_time
-
-# --- Full Karana (60) ---
-KARANA_MOVABLE = ["Bava","Balava","Kaulava","Taitila","Garaja","Vanija","Vishti"]
-KARANA_FIXED_END = ["Shakuni","Chatushpada","Naga"]
-KARANA_FIRST = "Kimstughna"
-
-def karana_name_by_index(idx: int) -> str:
-    if idx == 1:
-        return KARANA_FIRST
-    if 2 <= idx <= 57:
-        return KARANA_MOVABLE[(idx - 2) % 7]
-    if 58 <= idx <= 60:
-        return KARANA_FIXED_END[idx - 58]
-    raise ValueError("karana index 1..60 required")
-
-def karana_index_and_end(sunrise_utc: datetime, ayanamsha: str) -> Tuple[int, datetime]:
-    s, m = sun_moon_sidereal_longitudes(sunrise_utc, ayanamsha)
-    delta = norm360(m - s)
-    idx = int(delta // KARANA_DEG) + 1
-    target = ((math.floor(delta / KARANA_DEG) + 1) * KARANA_DEG) % 360.0
-    def crosses(t: datetime) -> bool:
-        s2, m2 = sun_moon_sidereal_longitudes(t, ayanamsha)
-        d2 = norm360(m2 - s2)
-        return d2 < KARANA_DEG if target == 0 else d2 >= target
-    end_time = find_event_end_time(sunrise_utc, crosses)
-    return idx, end_time
-
-def day_segments(start: datetime, end: datetime):
-    seg = (end - start) / 8
-    return [(start + i*seg, start + (i+1)*seg) for i in range(8)]
-
-def rahu_yama_gulika(sunrise: datetime, sunset: datetime, weekday: str) -> Dict[str, Dict[str,str]]:
-    parts = day_segments(sunrise, sunset)
-    def pick(idx: int):
-        i = idx - 1
-        return parts[i][0].isoformat(), parts[i][1].isoformat()
-    rh_s, rh_e = pick(RAHU_IDX[weekday])
-    ya_s, ya_e = pick(YAMA_IDX[weekday])
-    gu_s, gu_e = pick(GULI_IDX[weekday])
-    return {
-        "rahukalam": {"start": rh_s, "end": rh_e},
-        "yamagandam": {"start": ya_s, "end": ya_e},
-        "gulika": {"start": gu_s, "end": gu_e}
-    }
-
-# -----------------------------
-# Vimshottari engine (tz-aware output)
-# -----------------------------
-def moon_nakshatra_info(dt_utc: datetime, ayanamsha: str) -> Tuple[int, float]:
-    _, m = sun_moon_sidereal_longitudes(dt_utc, ayanamsha)
-    span = SEG_27
-    idx = int(m // span) + 1
-    frac = (m % span) / span
-    return idx, frac
-
-def lord_of_nakshatra(nak_idx: int) -> str:
-    return DASHA_ORDER_9[(nak_idx - 1) % 9]
-
-def cycle_from_lord(start_lord: str) -> List[str]:
-    i = DASHA_ORDER_9.index(start_lord)
-    return DASHA_ORDER_9[i:] + DASHA_ORDER_9[:i]
-
-def add_years(dt: datetime, years: float) -> datetime:
-    return dt + timedelta(days=years * DAYS_PER_YEAR)
-
-def vimshottari_maha_schedule_from_birth(birth_dt_utc: datetime, ayanamsha: str, horizon_years: int = 120):
-    nak_idx, frac_elapsed = moon_nakshatra_info(birth_dt_utc, ayanamsha)
-    start_lord = lord_of_nakshatra(nak_idx)
-    order = cycle_from_lord(start_lord)
-    out = []
-    t = birth_dt_utc
-
-    # balance of current lord
-    full = DASHA_YEARS[start_lord]
-    remaining = full * (1.0 - frac_elapsed)
-    end = add_years(t, remaining)
-    out.append({"period": start_lord, "start": t, "end": end})
-    t, total = end, remaining
-
-    for lord in order[1:] + order * 12:
-        yrs = DASHA_YEARS[lord]
-        if total + yrs > horizon_years:
-            end = add_years(t, max(0.0, horizon_years - total))
-            out.append({"period": lord, "start": t, "end": end})
-            break
-        end = add_years(t, yrs)
-        out.append({"period": lord, "start": t, "end": end})
-        t, total = end, total + yrs
-        if total >= horizon_years:
-            break
-    return out
-
-def subdivide_antar(parent_start: datetime, parent_end: datetime, maha_lord: str):
-    order = cycle_from_lord(maha_lord)
-    total = (parent_end - parent_start).total_seconds()
-    t = parent_start
-    out = []
-    for sub in order:
-        frac = DASHA_YEARS[sub] / 120.0
-        dur = timedelta(seconds=total * frac)
-        end = t + dur
-        out.append({"period": sub, "start": t, "end": end})
-        t = end
-    out[-1]["end"] = parent_end
-    return out
-
-def subdivide_pratyantar(antar_start: datetime, antar_end: datetime, antar_lord: str):
-    order = cycle_from_lord(antar_lord)
-    total = (antar_end - antar_start).total_seconds()
-    t = antar_start
-    out = []
-    for sub in order:
-        frac = DASHA_YEARS[sub] / 120.0
-        dur = timedelta(seconds=total * frac)
-        end = t + dur
-        out.append({"period": sub, "start": t, "end": end})
-        t = end
-    out[-1]["end"] = antar_end
-    return out
-
-def vimshottari_tree(
-    birth_dt_utc: datetime,
-    levels: int,
-    horizon_years: int,
-    ayanamsha: str,
-    tz: ZoneInfo
-) -> List[Dict]:
-    """
-    Builds Vimshottari tree and RETURNS dates in the caller's timezone (tz).
-    Internally computes in UTC for ephemeris consistency.
-    """
-    maha = vimshottari_maha_schedule_from_birth(birth_dt_utc, ayanamsha, horizon_years)
-
-    def d_local(d: datetime) -> str:
-        # convert UTC -> local tz, then return ISO DATE (no time) as most dasha tables do
-        return d.astimezone(tz).date().isoformat()
-
-    if levels <= 1:
-        return [{
-            "period": m["period"],
-            "start": d_local(m["start"]),
-            "end": d_local(m["end"]),
-            "sub": []
-        } for m in maha]
-
-    out: List[Dict] = []
-    for m in maha:
-        row = {
-            "period": m["period"],
-            "start": d_local(m["start"]),
-            "end": d_local(m["end"]),
-            "sub": []
-        }
-        antars = subdivide_antar(m["start"], m["end"], m["period"])
-        if levels >= 2:
-            for a in antars:
-                arow = {
-                    "period": a["period"],
-                    "start": d_local(a["start"]),
-                    "end": d_local(a["end"]),
-                    "sub": []
-                }
-                if levels >= 3:
-                    pratis = subdivide_pratyantar(a["start"], a["end"], a["period"])
-                    arow["sub"] = [{
-                        "period": p["period"],
-                        "start": d_local(p["start"]),
-                        "end": d_local(p["end"])
-                    } for p in pratis]
-                row["sub"].append(arow)
-        out.append(row)
-    return out
-
-# -----------------------------
-# Endpoints
-# -----------------------------
-@app.post("/calc_panchanga")
-def calc_panchanga(inp: PanchangaIn):
-    tz = ZoneInfo(inp.tz)
-    d = date.fromisoformat(inp.date_iso)
-    loc = LocationInfo(latitude=inp.lat, longitude=inp.lon)
-    sdata = sun(loc.observer, date=d, tzinfo=tz)
-    sunrise_local, sunset_local = sdata["sunrise"], sdata["sunset"]
-    vara = sunrise_local.strftime("%A")
-
-    sunrise_utc = sunrise_local.astimezone(ZoneInfo("UTC"))
-    t_idx, t_end = tithi_index_and_end(sunrise_utc, inp.ayanamsha)
-    n_idx, n_end = nakshatra_index_and_end(sunrise_utc, inp.ayanamsha)
-    y_idx, y_end = yoga_index_and_end(sunrise_utc, inp.ayanamsha)
-    k_idx, k_end = karana_index_and_end(sunrise_utc, inp.ayanamsha)
-
-    spans = rahu_yama_gulika(sunrise_local, sunset_local, vara)
-    midday = sunrise_local + (sunset_local - sunrise_local) / 2
-    half = (sunset_local - sunrise_local) / 30
-    abhijit = {"start": (midday - half).isoformat(), "end": (midday + half).isoformat()}
-
-    return {
-        "location": {"lat": inp.lat, "lon": inp.lon, "tz": inp.tz},
-        "sunrise": sunrise_local.isoformat(),
-        "sunset": sunset_local.isoformat(),
-        "vara": vara,
-        "tithi": {
-            "name": TITHI_NAMES[t_idx-1],
-            "index": t_idx,
-            "ends_at": t_end.astimezone(tz).isoformat()
-        },
-        "nakshatra": {
-            "name": NAK_NAMES[n_idx-1],
-            "index": n_idx,
-            "ends_at": n_end.astimezone(tz).isoformat()
-        },
-        "yoga": {
-            "name": YOGA_NAMES[y_idx-1],
-            "index": y_idx,
-            "ends_at": y_end.astimezone(tz).isoformat()
-        },
-        "karana": {
-            "name": karana_name_by_index(k_idx),
-            "index": k_idx,
-            "ends_at": k_end.astimezone(tz).isoformat()
-        },
-        **spans,
-        "abhijit": abhijit,
-        "choghadiya": []
-    }
-
-@app.post("/calc_birth_chart")
-def calc_birth_chart(inp: BirthChartIn):
-    # Minimal placeholders; swap with full chart math later
-    return {
-        "ayanamsha": inp.ayanamsha,
-        "tz": inp.tz,
-        "house_system": "WholeSign",
-        "lagna": {"sign": "Capricorn", "degree": 12.34},
-        "planets": {
-            "Sun": {"sign": "Aquarius", "degree": 20.1, "house": 2, "retro": False},
-            "Moon": {"sign": "Taurus", "degree": 5.2, "house": 5, "retro": False},
-            "Mars": {"sign": "Capricorn", "degree": 18.0, "house": 1, "retro": False}
-        },
-        "nakshatras": {"Moon": {"name": "Rohini", "pada": 2}},
-        "strengths": {"shadbala": {"Sun": 92, "Moon": 108}},
-        "vargas": {"D1": {}, "D9": {}, "D10": {}}
-    }
-
-@app.post("/calc_dasha")
-def calc_dasha(inp: DashaIn):
-    if inp.method != "Vimshottari":
-        return {"error": "Only Vimshottari is implemented."}
-
-    # Parse input datetime; normalize to UTC for internal calculations
-    dt = datetime.fromisoformat(inp.start_iso)
-    if dt.tzinfo is None:
-        dt_utc = dt.replace(tzinfo=ZoneInfo("UTC"))   # assume UTC if naive
-    else:
-        dt_utc = dt.astimezone(ZoneInfo("UTC"))
-
-    # Output timezone for dates (IST by default; user can override via inp.tz)
-    out_tz = ZoneInfo(inp.tz)
-
-    tree = vimshottari_tree(
-        birth_dt_utc=dt_utc,
-        levels=max(1, min(inp.levels, 3)),
-        horizon_years=120,
-        ayanamsha="Lahiri",
-        tz=out_tz
-    )
-    return {"method": "Vimshottari", "levels": inp.levels, "tz": inp.tz, "periods": tree}
-
-@app.post("/calc_transits")
-def calc_transits(inp: TransitsIn):
-    base = datetime.fromisoformat(inp.from_iso)
-    return {
-        "windows": [
-            {"window": f"{base.date()} to {(base+timedelta(days=90)).date()}",
-             "planet":"Saturn","aspect":"trine","to_natal":"Moon","orb_deg": inp.orb_deg},
-            {"window": f"{(base+timedelta(days=120)).date()} to {(base+timedelta(days=210)).date()}",
-             "planet":"Jupiter","aspect":"conjunction","to_natal":"Lagna","orb_deg": inp.orb_deg}
-        ],
-        "retrogrades": [
-            {"planet":"Mercury","from": (base+timedelta(days=30)).date().isoformat(),
-             "to": (base+timedelta(days=50)).date().isoformat()}
-        ]
-    }
-
-@app.post("/calc_muhurta")
-def calc_muhurta(inp: MuhurtaIn):
-    tz = ZoneInfo(inp.tz)
-    d = datetime.fromisoformat(inp.date_iso).astimezone(tz)
-    loc = LocationInfo(latitude=inp.lat, longitude=inp.lon)
-    sdata = sun(loc.observer, date=d.date(), tzinfo=tz)
-    slots = [
-        {"start": sdata["sunrise"].replace(hour=9, minute=12).isoformat(),
-         "end": sdata["sunrise"].replace(hour=10, minute=24).isoformat(),
-         "quality":"good"},
-        {"start": sdata["sunrise"].replace(hour=14, minute=5).isoformat(),
-         "end": sdata["sunrise"].replace(hour=15, minute=16).isoformat(),
-         "quality":"excellent"}
-    ]
-    return {
-        "panchanga": {"hint": "Use /calc_panchanga for precise tithi/nakshatra/yoga/karana"},
-        "rahukalam": {},
-        "yamagandam": {},
-        "choghadiya": [],
-        "recommended_slots": slots,
-        "activity": inp.activity
-    }
-
-@app.get("/")
-def root():
-    return {"ok": True, "message": "Jyotisa Compute API is running."}
+    target = (
