@@ -9,7 +9,7 @@ from astral.sun import sun
 import math
 import swisseph as swe  # Swiss Ephemeris
 
-app = FastAPI(title="Jyotisa Compute API", version="2.0.0")
+app = FastAPI(title="Jyotisa Compute API", version="2.1.0")
 
 # --- CORS (allow GPT Actions) ---
 app.add_middleware(
@@ -23,9 +23,9 @@ app.add_middleware(
 # -----------------------------
 # Swiss Ephemeris configuration
 # -----------------------------
-swe.set_ephe_path("")  # use packaged ephemeris if available (must be str, not bytes)
+# NOTE: set_ephe_path requires str (not bytes). Empty string = packaged/default path.
+swe.set_ephe_path("")            # ✅ string, not bytes
 swe.set_sid_mode(swe.SIDM_LAHIRI, 0, 0)  # default Lahiri
-
 
 # -----------------------------
 # Constants & lookups
@@ -83,9 +83,10 @@ class BirthChartIn(BaseModel):
     vargas: List[str] = Field(default_factory=lambda: ["D1","D9","D10"])
 
 class DashaIn(BaseModel):
-    start_iso: str
+    start_iso: str  # Birth datetime (tz-aware preferred, e.g. "1986-02-07T04:20:00+05:30")
     method: Literal["Vimshottari","Yogini","CharA"] = "Vimshottari"
-    levels: int = 3
+    levels: int = 3  # 1=Mahadasha, 2=+Antar, 3=+Pratyantar
+    tz: str = IST    # Output timezone for dates (default Asia/Kolkata)
 
 class TransitsIn(BaseModel):
     from_iso: str
@@ -233,7 +234,7 @@ def rahu_yama_gulika(sunrise: datetime, sunset: datetime, weekday: str) -> Dict[
     }
 
 # -----------------------------
-# Vimshottari engine
+# Vimshottari engine (tz-aware output)
 # -----------------------------
 def moon_nakshatra_info(dt_utc: datetime, ayanamsha: str) -> Tuple[int, float]:
     _, m = sun_moon_sidereal_longitudes(dt_utc, ayanamsha)
@@ -307,20 +308,55 @@ def subdivide_pratyantar(antar_start: datetime, antar_end: datetime, antar_lord:
     out[-1]["end"] = antar_end
     return out
 
-def vimshottari_tree(birth_dt_utc: datetime, levels: int, horizon_years: int, ayanamsha: str):
+def vimshottari_tree(
+    birth_dt_utc: datetime,
+    levels: int,
+    horizon_years: int,
+    ayanamsha: str,
+    tz: ZoneInfo
+) -> List[Dict]:
+    """
+    Builds Vimshottari tree and RETURNS dates in the caller's timezone (tz).
+    Internally computes in UTC for ephemeris consistency.
+    """
     maha = vimshottari_maha_schedule_from_birth(birth_dt_utc, ayanamsha, horizon_years)
+
+    def d_local(d: datetime) -> str:
+        # convert UTC -> local tz, then return ISO DATE (no time) as most dasha tables do
+        return d.astimezone(tz).date().isoformat()
+
     if levels <= 1:
-        return [{"period": m["period"], "start": m["start"].date().isoformat(), "end": m["end"].date().isoformat(), "sub": []} for m in maha]
-    out = []
+        return [{
+            "period": m["period"],
+            "start": d_local(m["start"]),
+            "end": d_local(m["end"]),
+            "sub": []
+        } for m in maha]
+
+    out: List[Dict] = []
     for m in maha:
-        row = {"period": m["period"], "start": m["start"].date().isoformat(), "end": m["end"].date().isoformat(), "sub": []}
+        row = {
+            "period": m["period"],
+            "start": d_local(m["start"]),
+            "end": d_local(m["end"]),
+            "sub": []
+        }
         antars = subdivide_antar(m["start"], m["end"], m["period"])
         if levels >= 2:
             for a in antars:
-                arow = {"period": a["period"], "start": a["start"].date().isoformat(), "end": a["end"].date().isoformat(), "sub": []}
+                arow = {
+                    "period": a["period"],
+                    "start": d_local(a["start"]),
+                    "end": d_local(a["end"]),
+                    "sub": []
+                }
                 if levels >= 3:
                     pratis = subdivide_pratyantar(a["start"], a["end"], a["period"])
-                    arow["sub"] = [{"period": p["period"], "start": p["start"].date().isoformat(), "end": p["end"].date().isoformat()} for p in pratis]
+                    arow["sub"] = [{
+                        "period": p["period"],
+                        "start": d_local(p["start"]),
+                        "end": d_local(p["end"])
+                    } for p in pratis]
                 row["sub"].append(arow)
         out.append(row)
     return out
@@ -400,13 +436,25 @@ def calc_birth_chart(inp: BirthChartIn):
 def calc_dasha(inp: DashaIn):
     if inp.method != "Vimshottari":
         return {"error": "Only Vimshottari is implemented."}
+
+    # Parse input datetime; normalize to UTC for internal calculations
     dt = datetime.fromisoformat(inp.start_iso)
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+        dt_utc = dt.replace(tzinfo=ZoneInfo("UTC"))   # assume UTC if naive
     else:
-        dt = dt.astimezone(ZoneInfo("UTC"))
-    tree = vimshottari_tree(dt, levels=max(1, min(inp.levels, 3)), horizon_years=120, ayanamsha="Lahiri")
-    return {"method": "Vimshottari", "levels": inp.levels, "periods": tree}
+        dt_utc = dt.astimezone(ZoneInfo("UTC"))
+
+    # Output timezone for dates (IST by default; user can override via inp.tz)
+    out_tz = ZoneInfo(inp.tz)
+
+    tree = vimshottari_tree(
+        birth_dt_utc=dt_utc,
+        levels=max(1, min(inp.levels, 3)),
+        horizon_years=120,
+        ayanamsha="Lahiri",
+        tz=out_tz
+    )
+    return {"method": "Vimshottari", "levels": inp.levels, "tz": inp.tz, "periods": tree}
 
 @app.post("/calc_transits")
 def calc_transits(inp: TransitsIn):
