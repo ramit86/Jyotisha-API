@@ -10,6 +10,7 @@ import math
 import swisseph as swe  # Swiss Ephemeris
 
 app = FastAPI(title="Jyotisa Compute API", version="2.0.0")
+
 # --- CORS (allow GPT Actions) ---
 app.add_middleware(
     CORSMiddleware,
@@ -18,6 +19,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 # -----------------------------
 # Swiss Ephemeris configuration
 # -----------------------------
@@ -128,142 +130,4 @@ def sun_moon_sidereal_longitudes(dt_utc: datetime, ayanamsha: str = "Lahiri") ->
     jd = to_jd_ut(dt_utc)
     flag = swe.FLG_SWIEPH | swe.FLG_SIDEREAL
     sun = swe.calc_ut(jd, swe.SUN, flag)[0]
-    moon = swe.calc_ut(jd, swe.MOON, flag)[0]
-    return norm360(sun[0]), norm360(moon[0])
-
-def find_event_end_time(start_utc: datetime, predicate_crosses, max_hours=48, coarse_step_min=10, refine_to_seconds=30) -> datetime:
-    t = start_utc
-    end = start_utc + timedelta(hours=max_hours)
-    step = timedelta(minutes=coarse_step_min)
-    while t <= end and not predicate_crosses(t):
-        t += step
-    lo, hi = t - step, t
-    if lo < start_utc:
-        lo = start_utc
-    while (hi - lo).total_seconds() > refine_to_seconds:
-        mid = lo + (hi - lo) / 2
-        if predicate_crosses(mid):
-            hi = mid
-        else:
-            lo = mid
-    return hi
-
-# -----------------------------
-# Panchanga core
-# -----------------------------
-def tithi_index_and_end(sunrise_utc: datetime, ayanamsha: str) -> Tuple[int, datetime]:
-    s, m = sun_moon_sidereal_longitudes(sunrise_utc, ayanamsha)
-    delta = norm360(m - s)
-    idx = int(delta // TITHI_DEG) + 1
-    target = ((idx) * TITHI_DEG) % 360.0
-    def crosses(t: datetime) -> bool:
-        s2, m2 = sun_moon_sidereal_longitudes(t, ayanamsha)
-        d2 = norm360(m2 - s2)
-        return d2 < TITHI_DEG if target == 0 else d2 >= target
-    end_time = find_event_end_time(sunrise_utc, crosses)
-    return idx, end_time
-
-def nakshatra_index_and_end(sunrise_utc: datetime, ayanamsha: str) -> Tuple[int, datetime]:
-    _, m = sun_moon_sidereal_longitudes(sunrise_utc, ayanamsha)
-    idx = int(m // SEG_27) + 1
-    target = ((math.floor(m / SEG_27) + 1) * SEG_27) % 360.0
-    def crosses(t: datetime) -> bool:
-        _, m2 = sun_moon_sidereal_longitudes(t, ayanamsha)
-        return m2 < SEG_27 if target == 0 else m2 >= target
-    end_time = find_event_end_time(sunrise_utc, crosses)
-    return idx, end_time
-
-def yoga_index_and_end(sunrise_utc: datetime, ayanamsha: str) -> Tuple[int, datetime]:
-    s, m = sun_moon_sidereal_longitudes(sunrise_utc, ayanamsha)
-    y = norm360(s + m)
-    idx = int(y // SEG_27) + 1
-    target = ((math.floor(y / SEG_27) + 1) * SEG_27) % 360.0
-    def crosses(t: datetime) -> bool:
-        s2, m2 = sun_moon_sidereal_longitudes(t, ayanamsha)
-        y2 = norm360(s2 + m2)
-        return y2 < SEG_27 if target == 0 else y2 >= target
-    end_time = find_event_end_time(sunrise_utc, crosses)
-    return idx, end_time
-
-# --- Full Karana (60) ---
-KARANA_MOVABLE = ["Bava","Balava","Kaulava","Taitila","Garaja","Vanija","Vishti"]
-KARANA_FIXED_END = ["Shakuni","Chatushpada","Naga"]
-KARANA_FIRST = "Kimstughna"
-
-def karana_name_by_index(idx: int) -> str:
-    if idx == 1:
-        return KARANA_FIRST
-    if 2 <= idx <= 57:
-        return KARANA_MOVABLE[(idx - 2) % 7]
-    if 58 <= idx <= 60:
-        return KARANA_FIXED_END[idx - 58]
-    raise ValueError("karana index 1..60 required")
-
-def karana_index_and_end(sunrise_utc: datetime, ayanamsha: str) -> Tuple[int, datetime]:
-    s, m = sun_moon_sidereal_longitudes(sunrise_utc, ayanamsha)
-    delta = norm360(m - s)
-    idx = int(delta // KARANA_DEG) + 1
-    target = ((math.floor(delta / KARANA_DEG) + 1) * KARANA_DEG) % 360.0
-    def crosses(t: datetime) -> bool:
-        s2, m2 = sun_moon_sidereal_longitudes(t, ayanamsha)
-        d2 = norm360(m2 - s2)
-        return d2 < KARANA_DEG if target == 0 else d2 >= target
-    end_time = find_event_end_time(sunrise_utc, crosses)
-    return idx, end_time
-
-def day_segments(start: datetime, end: datetime):
-    seg = (end - start) / 8
-    return [(start + i*seg, start + (i+1)*seg) for i in range(8)]
-
-def rahu_yama_gulika(sunrise: datetime, sunset: datetime, weekday: str) -> Dict[str, Dict[str,str]]:
-    parts = day_segments(sunrise, sunset)
-    def pick(idx: int):
-        i = idx - 1
-        return parts[i][0].isoformat(), parts[i][1].isoformat()
-    rh_s, rh_e = pick(RAHU_IDX[weekday])
-    ya_s, ya_e = pick(YAMA_IDX[weekday])
-    gu_s, gu_e = pick(GULI_IDX[weekday])
-    return {
-        "rahukalam": {"start": rh_s, "end": rh_e},
-        "yamagandam": {"start": ya_s, "end": ya_e},
-        "gulika": {"start": gu_s, "end": gu_e}
-    }
-
-# -----------------------------
-# Vimshottari engine
-# -----------------------------
-def moon_nakshatra_info(dt_utc: datetime, ayanamsha: str) -> Tuple[int, float]:
-    _, m = sun_moon_sidereal_longitudes(dt_utc, ayanamsha)
-    span = SEG_27
-    idx = int(m // span) + 1
-    frac = (m % span) / span
-    return idx, frac
-
-def lord_of_nakshatra(nak_idx: int) -> str:
-    return DASHA_ORDER_9[(nak_idx - 1) % 9]
-
-def cycle_from_lord(start_lord: str) -> List[str]:
-    i = DASHA_ORDER_9.index(start_lord)
-    return DASHA_ORDER_9[i:] + DASHA_ORDER_9[:i]
-
-def add_years(dt: datetime, years: float) -> datetime:
-    return dt + timedelta(days=years * DAYS_PER_YEAR)
-
-def vimshottari_maha_schedule_from_birth(birth_dt_utc: datetime, ayanamsha: str, horizon_years: int = 120):
-    nak_idx, frac_elapsed = moon_nakshatra_info(birth_dt_utc, ayanamsha)
-    start_lord = lord_of_nakshatra(nak_idx)
-    order = cycle_from_lord(start_lord)
-    out = []
-    t = birth_dt_utc
-
-    # balance of current lord
-    full = DASHA_YEARS[start_lord]
-    remaining = full * (1.0 - frac_elapsed)
-    end = add_years(t, remaining)
-    out.append({"period": start_lord, "start": t, "end": end})
-    t, total = end, remaining
-
-    for lord in order[1:] + order * 12:
-        yrs = DASHA_YEARS[lord]
-        if total + yrs > horizon_years:
-            end = add_years(t, max(0.0, horizon_years -
+    moon = swe.calc_ut(jd, swe_
