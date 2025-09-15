@@ -1,4 +1,4 @@
-# main.py — Jyotisa Compute API (v2.2.0)
+# main.py — Jyotisa Compute API (v2.3.0)
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,7 +12,7 @@ import math
 import re
 import swisseph as swe  # Swiss Ephemeris
 
-app = FastAPI(title="Jyotisa Compute API", version="2.2.0")
+app = FastAPI(title="Jyotisa Compute API", version="2.3.0")
 
 # --- CORS (allow GPT Actions) ---
 app.add_middleware(
@@ -83,11 +83,12 @@ DAYS_PER_YEAR = 365.2425
 # -----------------------------
 class BirthChartIn(BaseModel):
     dob_iso: str                     # "YYYY-MM-DD"
-    tob_iso: str                     # accepts "HH:MM", "HH:MM:SS", or "h:MM AM/PM"
+    tob_iso: str                     # "HH:MM", "HH:MM:SS", or "h:MM AM/PM"
     lat: float
     lon: float                       # East = positive, West = negative
     tz: str = IST                    # e.g., "Asia/Kolkata"
     ayanamsha: Literal["Lahiri","Raman","Krishnamurti"] = "Lahiri"
+    node: Literal["Mean","True"] = "Mean"
     vargas: List[str] = Field(default_factory=lambda: ["D1","D9","D10"])
 
 class DashaIn(BaseModel):
@@ -122,6 +123,7 @@ class DebugBirthIn(BaseModel):
     lon: float
     tz: str = IST
     ayanamsha: Literal["Lahiri","Raman","Krishnamurti"] = "Lahiri"
+    node: Literal["Mean","True"] = "Mean"
 
 # -----------------------------
 # Utilities
@@ -138,6 +140,17 @@ def to_jd_ut(dt: datetime) -> float:
     hour = dt_utc.hour + dt_utc.minute/60 + dt_utc.second/3600 + dt_utc.microsecond/3.6e9
     return swe.julday(y, m, d, hour, swe.GREG_CAL)
 
+# --- Robust wrapper around swe.calc_ut (handles (positions, retflag) OR positions) ---
+def swe_calc_positions(jd_ut: float, body: int, flags: int):
+    res = swe.calc_ut(jd_ut, body, flags)
+    # pyswisseph usually returns (pos_tuple, retflag), but handle plain tuple too
+    if isinstance(res, tuple) and len(res) == 2 and isinstance(res[0], (list, tuple)):
+        pos, _retflag = res
+    else:
+        pos = res
+    # pos: (lon, lat, dist, lon_speed, lat_speed, dist_speed)
+    return pos
+
 def sun_moon_sidereal_longitudes(dt_utc: datetime, ayanamsha: str = "Lahiri") -> Tuple[float,float]:
     if ayanamsha == "Lahiri":
         swe.set_sid_mode(swe.SIDM_LAHIRI, 0, 0)
@@ -147,8 +160,8 @@ def sun_moon_sidereal_longitudes(dt_utc: datetime, ayanamsha: str = "Lahiri") ->
         swe.set_sid_mode(swe.SIDM_KRISHNAMURTI, 0, 0)
     jd = to_jd_ut(dt_utc)
     flag = swe.FLG_SWIEPH | swe.FLG_SIDEREAL
-    sun = swe.calc_ut(jd, swe.SUN, flag)[0]
-    moon = swe.calc_ut(jd, swe.MOON, flag)[0]
+    sun = swe_calc_positions(jd, swe.SUN, flag)
+    moon = swe_calc_positions(jd, swe.MOON, flag)
     return norm360(sun[0]), norm360(moon[0])
 
 def find_event_end_time(start_utc: datetime, predicate_crosses, max_hours=48, coarse_step_min=10, refine_to_seconds=30) -> datetime:
@@ -222,13 +235,15 @@ def ascendant_sidereal_deg_by_subtract(jd_ut: float, lat: float, lon: float) -> 
     return norm360(asc_trop - ayan)
 
 def ascendant_sidereal_deg(jd_ut: float, lat: float, lon: float) -> float:
+    # sidereal houses_ex
     cusps, ascmc = swe.houses_ex(jd_ut, lat, lon, b'W', swe.FLG_SIDEREAL)
     return norm360(ascmc[0])
 
 def planet_sidereal(jd_ut: float, p_id: int) -> Tuple[float, float]:
     flags = swe.FLG_SWIEPH | swe.FLG_SIDEREAL | swe.FLG_SPEED
-    lon, lat, dist, lspd, _, _ = swe.calc_ut(jd_ut, p_id, flags)
-    return norm360(lon), lspd
+    pos = swe_calc_positions(jd_ut, p_id, flags)
+    lon, lon_speed = pos[0], pos[3]
+    return norm360(lon), lon_speed
 
 def sign_index(lon_deg: float) -> int:
     return int(lon_deg // 30) + 1  # 1..12
@@ -508,7 +523,7 @@ def calc_birth_chart(inp: BirthChartIn):
     planet_map = {
         "Sun": swe.SUN, "Moon": swe.MOON, "Mars": swe.MARS, "Mercury": swe.MERCURY,
         "Jupiter": swe.JUPITER, "Venus": swe.VENUS, "Saturn": swe.SATURN,
-        "Rahu": swe.MEAN_NODE  # switch to swe.TRUE_NODE if needed
+        "Rahu": swe.TRUE_NODE if inp.node == "True" else swe.MEAN_NODE
     }
 
     placements: Dict[str, Dict] = {}
@@ -553,7 +568,7 @@ def calc_birth_chart(inp: BirthChartIn):
         },
         "planets": placements,
         "nakshatras": {"Moon": {"name": nak_name, "pada": pada}},
-        "vargas": {v: {} for v in inp.vargas}  # placeholder container for future varga computation
+        "vargas": {v: {} for v in inp.vargas}
     }
 
 @app.post("/calc_dasha")
@@ -585,7 +600,7 @@ def calc_transits(inp: TransitsIn):
         "windows": [
             {"window": f"{base.date()} to {(base+timedelta(days=90)).date()}",
              "planet":"Saturn","aspect":"trine","to_natal":"Moon","orb_deg": inp.orb_deg},
-            {"window": f"{(base+timedelta(days=120)).date()} to {(base+timedelta(days=210)).date()}",
+            {"window": f"{(base+timedelta(days=120)).date()} to {(base+timetimedelta(days=210)).date()}",
              "planet":"Jupiter","aspect":"conjunction","to_natal":"Lagna","orb_deg": inp.orb_deg}
         ],
         "retrogrades": [
@@ -634,6 +649,8 @@ def debug_birth(inp: DebugBirthIn):
     asc1 = ascendant_sidereal_deg(jd_ut, inp.lat, inp.lon)
     asc2 = ascendant_sidereal_deg_by_subtract(jd_ut, inp.lat, inp.lon)
     delta = abs((asc1 - asc2 + 540) % 360 - 180)
+    node_id = swe.TRUE_NODE if inp.node == "True" else swe.MEAN_NODE
+    node_lon, _ = planet_sidereal(jd_ut, node_id)
     return {
         "local_datetime": dt_utc.astimezone(ZoneInfo(inp.tz)).isoformat(),
         "utc_datetime": dt_utc.isoformat(),
@@ -645,7 +662,9 @@ def debug_birth(inp: DebugBirthIn):
         "lat": inp.lat,
         "lon": inp.lon,
         "tz": inp.tz,
-        "ayanamsha": inp.ayanamsha
+        "ayanamsha": inp.ayanamsha,
+        "node_type": inp.node,
+        "node_lon_deg": round(node_lon, 6)
     }
 
 @app.get("/")
