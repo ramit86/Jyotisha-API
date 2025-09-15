@@ -23,8 +23,9 @@ app.add_middleware(
 # -----------------------------
 # Swiss Ephemeris configuration
 # -----------------------------
-swe.set_ephe_path(b"")  # use packaged ephemeris if available
+swe.set_ephe_path("")  # use packaged ephemeris if available (must be str, not bytes)
 swe.set_sid_mode(swe.SIDM_LAHIRI, 0, 0)  # default Lahiri
+
 
 # -----------------------------
 # Constants & lookups
