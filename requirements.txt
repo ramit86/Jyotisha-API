@@ -1,3 +1,5 @@
 fastapi
 uvicorn
 pydantic
+astral==3.2
+pyswisseph
